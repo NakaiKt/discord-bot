@@ -46,15 +46,9 @@ x-to-discord/
 渡すとtfstateに平文で残ってしまうため、AWS CLIやコンソールで直接、手動でSecureStringとして登録する。
 
 ```bash
-aws ssm put-parameter \
-  --name "/x-to-discord/x-bearer-token" \
-  --type "SecureString" \
-  --value "<X_BEARER_TOKEN>"
+aws ssm put-parameter --name "/x-to-discord/x-bearer-token" --type "SecureString" --value "<X_BEARER_TOKEN>"
 
-aws ssm put-parameter \
-  --name "/x-to-discord/discord-webhook-url" \
-  --type "SecureString" \
-  --value "<DISCORD_WEBHOOK_URL>"
+aws ssm put-parameter --name "/x-to-discord/discord-webhook-url"  --type "SecureString" --value "<DISCORD_WEBHOOK_URL>"
 ```
 
 パラメータ名を変えたい場合は `terraform/variables.tf` の `ssm_param_bearer_token` /

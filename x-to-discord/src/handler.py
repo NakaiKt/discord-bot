@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -13,6 +14,16 @@ logger.setLevel(logging.INFO)
 ssm = boto3.client("ssm")
 
 X_API_BASE = "https://api.x.com/2"
+
+# Discord's edge rejects requests that keep urllib's default "Python-urllib/x.y" User-Agent,
+# answering with a bodyless 403 before the request ever reaches the webhook. Every outbound
+# request therefore sends an explicit User-Agent.
+USER_AGENT = "x-to-discord-forwarder (https://github.com/NakaiKt/discord-bot, 1.0)"
+
+REQUEST_TIMEOUT = 15
+DISCORD_MAX_ATTEMPTS = 3
+# Longer waits than this would risk the Lambda timeout; the next scheduled run retries instead.
+DISCORD_RETRY_AFTER_CAP = 5.0
 
 
 def _get_ssm_parameter(name, decrypt):
@@ -40,22 +51,77 @@ def _fetch_tweets(bearer_token, user_id, since_id):
         params["since_id"] = since_id
 
     url = f"{X_API_BASE}/users/{user_id}/tweets?{urllib.parse.urlencode(params)}"
-    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {bearer_token}"})
-    with urllib.request.urlopen(request, timeout=15) as response:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {bearer_token}",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
         return json.load(response)
+
+
+def _describe_http_error(error):
+    """Summarize an HTTPError for logs.
+
+    A 403 from Discord is ambiguous without this: an edge block (bodyless or an HTML page
+    carrying a Cloudflare "error code: 10xx") and an application-level rejection
+    (JSON such as {"message": "Missing Permissions", "code": 50013}) share the status code.
+    """
+    try:
+        body = error.read().decode("utf-8", errors="replace").strip()
+    except OSError:
+        body = "<unreadable>"
+    return f"status={error.code} server={error.headers.get('Server')} body={body[:500]!r}"
+
+
+def _retry_after_seconds(error):
+    """Seconds Discord asks us to wait after a 429, or None when it did not say."""
+    header = error.headers.get("Retry-After")
+    if header is None:
+        return None
+    try:
+        return float(header)
+    except ValueError:
+        return None
 
 
 def _post_to_discord(webhook_url, tweet_id):
     link = f"https://x.com/i/web/status/{tweet_id}"
     body = json.dumps({"content": link}).encode("utf-8")
-    request = urllib.request.Request(
-        webhook_url,
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=15) as response:
-        response.read()
+
+    for attempt in range(1, DISCORD_MAX_ATTEMPTS + 1):
+        request = urllib.request.Request(
+            webhook_url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": USER_AGENT,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+                response.read()
+            return
+        except urllib.error.HTTPError as error:
+            if error.code != 429 or attempt == DISCORD_MAX_ATTEMPTS:
+                raise
+            retry_after = _retry_after_seconds(error)
+            if retry_after is None or retry_after > DISCORD_RETRY_AFTER_CAP:
+                raise
+            # Only closed on the retry path: the caller still needs to read the body
+            # of an error we re-raise.
+            error.close()
+            logger.warning(
+                "Discord rate limited for tweet_id=%s (attempt %s/%s); retrying in %ss",
+                tweet_id,
+                attempt,
+                DISCORD_MAX_ATTEMPTS,
+                retry_after,
+            )
+            time.sleep(retry_after)
 
 
 def lambda_handler(event, context):
@@ -94,6 +160,14 @@ def lambda_handler(event, context):
     for tweet in tweets:
         try:
             _post_to_discord(webhook_url, tweet["id"])
+        except urllib.error.HTTPError as error:
+            # Checked before URLError, which it subclasses, so the response details survive.
+            logger.error(
+                "Discord send failed for tweet_id=%s; stopping run (%s)",
+                tweet["id"],
+                _describe_http_error(error),
+            )
+            break
         except urllib.error.URLError:
             logger.exception("Discord send failed for tweet_id=%s; stopping run", tweet["id"])
             break

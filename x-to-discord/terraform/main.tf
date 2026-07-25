@@ -92,7 +92,9 @@ resource "aws_lambda_function" "this" {
   role             = aws_iam_role.lambda.arn
   handler          = "handler.lambda_handler"
   runtime          = "python3.13"
-  timeout          = 30
+  # Headroom for the Discord 429 retry/backoff path; billed on actual duration, so the
+  # larger ceiling costs nothing on normal runs.
+  timeout          = 90
   memory_size      = 128
   filename         = data.archive_file.lambda.output_path
   source_code_hash = data.archive_file.lambda.output_base64sha256

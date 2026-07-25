@@ -101,6 +101,25 @@ Lambda実行ロールには、Step 4で作成したSSMパラメータの取得�
   送信途中でエラーが起きても、成功済み分は次回再送されない。
 - X APIが429（レート超過）を返した場合、その回はスキップし状態を更新しない。
 - Discord送信が失敗した場合も、その回はそこで打ち切り状態を更新しない（次回リトライで拾う）。
+- Discordが429（レート超過）を返した場合は `Retry-After` に従って最大3回まで再送する。
+  待ち時間が5秒を超える場合はLambdaのタイムアウトを避けるため再送せず、次回の実行に委ねる。
+- 送信リクエストには明示的な `User-Agent` を付与する。urllibの既定値（`Python-urllib/x.y`）のままだと
+  Discordのエッジ（Cloudflare）に403で拒否され、リクエストがWebhookまで到達しない。
+
+## トラブルシューティング
+
+### Discord送信が403 Forbiddenで失敗する
+
+CloudWatch Logsの `Discord send failed for tweet_id=...` の行に `status` / `server` / `body` が出るので、
+本文で原因を切り分ける。
+
+| ログの `body` | 原因 | 対処 |
+|---|---|---|
+| 空、またはHTMLに `error code: 1010` / `1020` 等 | エッジ（Cloudflare）でのブロック | `User-Agent` が付いているか確認する。付いていて再発する場合は送信元IP側の問題 |
+| `{"message": "Missing Permissions", "code": 50013}` 等のJSON | Discord側の権限エラー | 対象チャンネルの権限・Webhookの設定を確認する |
+
+なお、tokenが誤っている場合は401、Webhookが削除済み・ID誤りの場合は404（`10015 Unknown Webhook`）が返る。
+403はこれらとは別の原因を示す。
 
 ## 設定変更
 

@@ -108,6 +108,61 @@ Lambda実行ロールには、Step 4で作成したSSMパラメータの取得�
 
 ## トラブルシューティング
 
+### X APIは動いているがDiscordに何も届かず、ログにもエラーがない
+
+まず「エラーがない」ことと「Discord送信処理まで到達した」ことを分けて確認する。Lambdaは各実行で
+`Poll started`、X API取得後に `X API poll completed`、正常終了時に `Poll completed` を出力する。
+`result_count=0` / `fetched=0` ならDiscordにはリクエストしておらず、WebhookではなくXの差分取得または
+保存済みstateを調べる。`fetched` が1以上で `sent=0` なら `Discord send failed` の行を調べる。
+
+以下の例では、リージョンやパラメータ名を実際の設定に合わせる。
+
+```bash
+# 1. EventBridgeから定期実行されているか（直近30分の開始・終了・診断ログ）
+aws logs tail /aws/lambda/x-to-discord-forwarder --since 30m --format short
+
+# 2. Lambdaを手動実行し、返り値のstatus/fetched/sentと新しいログを確認
+aws lambda invoke --function-name x-to-discord-forwarder \
+  --cli-binary-format raw-in-base64-out --payload '{}' /tmp/x-to-discord-result.json
+cat /tmp/x-to-discord-result.json
+
+# 3. 差分取得の基準になっているtweet_idを確認
+aws ssm get-parameter --name /x-to-discord/last-tweet-id --query 'Parameter.Value' --output text
+
+# 4. Lambdaが参照している環境変数（別リージョン・別パラメータ名の取り違えを確認）
+aws lambda get-function-configuration --function-name x-to-discord-forwarder \
+  --query '{State:State,LastUpdateStatus:LastUpdateStatus,Environment:Environment.Variables}'
+
+# 5. EventBridgeルールとターゲットが有効か確認
+aws events describe-rule --name x-to-discord-forwarder-schedule
+aws events list-targets-by-rule --rule x-to-discord-forwarder-schedule
+```
+
+主な見分け方:
+
+| 観測結果 | 原因候補 | 次に確認すること |
+|---|---|---|
+| `Poll started` 自体がない | EventBridge未実行、別リージョン/別ロググループを見ている | ルールの`State`、ターゲット、LambdaのMetrics `Invocations` |
+| `First run: recorded ... without sending` | 初回起動の仕様 | そのログより後に作成した新規ポストで再確認 |
+| `result_count=0` | 新規対象なし、ポストがreply/retweet、stateが最新より先、`x_user_id`違い | X APIレスポンスの`meta`、SSMのstate、対象投稿種別 |
+| `fetched>0 sent>0` | Lambda上はDiscordのHTTP成功（通常204） | Webhookの送信先チャンネル、チャンネル表示/権限、別Webhook URLの取り違え |
+| `status=discord_failed` | Discord HTTP/ネットワーク失敗 | 同じrequest ID付近の `Discord send failed` |
+
+Webhook URLそのものを単独確認する場合は、SSMから取得した値を画面や履歴へ表示せずにテストする。
+
+```bash
+WEBHOOK_URL="$(aws ssm get-parameter --name /x-to-discord/discord-webhook-url \
+  --with-decryption --query 'Parameter.Value' --output text)"
+curl --fail-with-body -sS -o /dev/null -w 'HTTP %{http_code}\n' \
+  -H 'Content-Type: application/json' \
+  -d '{"content":"x-to-discord webhook connectivity test"}' "$WEBHOOK_URL"
+unset WEBHOOK_URL
+```
+
+成功時は `HTTP 204` になりテストメッセージが届く。これが成功しLambdaが `result_count=0` なら、原因は
+Discord送信ではなく差分判定側にある。stateを削除すると次回実行は**初回扱いとなり、その時点の最新IDを
+記録するだけで過去投稿は送信しない**ため、調査目的で安易に削除しない。
+
 ### Discord送信が403 Forbiddenで失敗する
 
 CloudWatch Logsの `Discord send failed for tweet_id=...` の行に `status` / `server` / `body` が出るので、

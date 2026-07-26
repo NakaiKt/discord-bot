@@ -131,6 +131,12 @@ def lambda_handler(event, context):
     state_param_name = os.environ["SSM_PARAM_STATE"]
 
     last_tweet_id = _get_last_tweet_id(state_param_name)
+    logger.info(
+        "Poll started: request_id=%s user_id=%s last_tweet_id=%s",
+        getattr(context, "aws_request_id", "unknown"),
+        user_id,
+        last_tweet_id or "<unset>",
+    )
 
     try:
         payload = _fetch_tweets(bearer_token, user_id, last_tweet_id)
@@ -143,6 +149,14 @@ def lambda_handler(event, context):
         logger.exception("X API request failed; skipping this run")
         return {"status": "fetch_failed"}
 
+    tweets = payload.get("data", [])
+    logger.info(
+        "X API poll completed: result_count=%s newest_id=%s oldest_id=%s",
+        len(tweets),
+        payload.get("meta", {}).get("newest_id", "<none>"),
+        payload.get("meta", {}).get("oldest_id", "<none>"),
+    )
+
     if last_tweet_id is None:
         newest_id = payload.get("meta", {}).get("newest_id")
         if newest_id:
@@ -152,11 +166,11 @@ def lambda_handler(event, context):
             logger.info("First run: no posts found yet; state left unset")
         return {"status": "initialized"}
 
-    tweets = payload.get("data", [])
     # X returns newest-first; sort oldest-first so Discord receives posts in chronological order.
     tweets.sort(key=lambda tweet: int(tweet["id"]))
 
     sent_count = 0
+    failed_tweet_id = None
     for tweet in tweets:
         try:
             _post_to_discord(webhook_url, tweet["id"])
@@ -167,13 +181,30 @@ def lambda_handler(event, context):
                 tweet["id"],
                 _describe_http_error(error),
             )
+            failed_tweet_id = tweet["id"]
             break
         except urllib.error.URLError:
             logger.exception("Discord send failed for tweet_id=%s; stopping run", tweet["id"])
+            failed_tweet_id = tweet["id"]
             break
         # Advance state per tweet, right after each send, so a mid-run failure never re-sends
         # an already-posted tweet on the next poll.
         _set_last_tweet_id(state_param_name, tweet["id"])
         sent_count += 1
 
-    return {"status": "ok", "sent": sent_count}
+    if failed_tweet_id is not None:
+        logger.warning(
+            "Poll incomplete: fetched=%s sent=%s failed_tweet_id=%s",
+            len(tweets),
+            sent_count,
+            failed_tweet_id,
+        )
+        return {
+            "status": "discord_failed",
+            "fetched": len(tweets),
+            "sent": sent_count,
+            "failed_tweet_id": failed_tweet_id,
+        }
+
+    logger.info("Poll completed: fetched=%s sent=%s", len(tweets), sent_count)
+    return {"status": "ok", "fetched": len(tweets), "sent": sent_count}

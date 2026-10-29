@@ -269,80 +269,33 @@ def _scan_channel(channel_id, cutoff_ms, stats, context, stop_at=None):
         before = messages[-1]["id"]
 
 
-def _iter_archived_threads(parent_id, private_joined, stop_at):
-    """Enumerate accessible archived threads, following Discord's distinct cursors."""
-    if private_joined:
-        endpoint = f"/channels/{parent_id}/users/@me/threads/archived/private"
-    else:
-        endpoint = f"/channels/{parent_id}/threads/archived/public"
-    before = None
-    while True:
-        _check_deadline(stop_at)
-        params = {"limit": 100}
-        if before:
-            params["before"] = before
-        path = endpoint + "?" + urllib.parse.urlencode(params)
-        page = _discord_request("GET", path, stop_at=stop_at)
-        threads = page.get("threads", [])
-        for thread in threads:
-            yield thread
-        if not threads or not page.get("has_more"):
-            return
-        # Public archive is sorted by archive time; joined private by thread ID.
-        if private_joined:
-            next_before = threads[-1]["id"]
-        else:
-            next_before = threads[-1]["thread_metadata"]["archive_timestamp"]
-        if before == next_before:
-            raise RuntimeError("Archived thread pagination cursor did not advance")
-        before = next_before
-
-
 def _aggregate(guild_id, days, context, stop_at=None):
     emojis = _discord_request("GET", f"/guilds/{guild_id}/emojis", stop_at=stop_at)
     stats = {emoji["id"]: {"emoji": emoji, "content": 0, "reaction": 0} for emoji in emojis}
     guild_channels = _discord_request("GET", f"/guilds/{guild_id}/channels", stop_at=stop_at)
     channels = [c for c in guild_channels if c.get("type") in READABLE_CHANNEL_TYPES]
-    active = _discord_request("GET", f"/guilds/{guild_id}/threads/active", stop_at=stop_at)
-    active_threads = active.get("threads", [])
+    active_threads = _discord_request(
+        "GET", f"/guilds/{guild_id}/threads/active", stop_at=stop_at
+    ).get("threads", [])
 
     cutoff_ms = int(time.time() * 1000) - days * 86_400_000
-    summary = {"channels": 0, "messages": 0, "skipped": 0,
-               "archive_sources_skipped": 0, "timed_out": False}
-
-    def scan(channel):
-        last_id = channel.get("last_message_id")
-        # Do not skip a channel whose last_message_id is absent: it can be incomplete.
-        if last_id and _snowflake_ms(last_id) < cutoff_ms:
-            return
-        try:
-            summary["messages"] += _scan_channel(
-                channel["id"], cutoff_ms, stats, context, stop_at=stop_at
-            )
-            summary["channels"] += 1
-        except urllib.error.HTTPError as error:
-            if error.code not in (403, 404):
-                raise
-            summary["skipped"] += 1
+    summary = {"channels": 0, "messages": 0, "skipped": 0, "timed_out": False}
 
     try:
         for channel in channels + active_threads:
-            scan(channel)
-
-        # Active guild threads omit archived posts (including forum posts).
-        # Enumerate public archives in text/announcement/forum/media parents,
-        # plus private archives joined by this bot in text parents.
-        parents = [c for c in guild_channels if c.get("type") in (0, 5, 15, 16)]
-        for parent in parents:
-            kinds = (False, True) if parent["type"] == 0 else (False,)
-            for private_joined in kinds:
-                try:
-                    for thread in _iter_archived_threads(parent["id"], private_joined, stop_at):
-                        scan(thread)
-                except urllib.error.HTTPError as error:
-                    if error.code not in (403, 404):
-                        raise
-                    summary["archive_sources_skipped"] += 1
+            # An absent last_message_id does not prove there is no recent history.
+            last_id = channel.get("last_message_id")
+            if last_id and _snowflake_ms(last_id) < cutoff_ms:
+                continue
+            try:
+                summary["messages"] += _scan_channel(
+                    channel["id"], cutoff_ms, stats, context, stop_at=stop_at
+                )
+                summary["channels"] += 1
+            except urllib.error.HTTPError as error:
+                if error.code not in (403, 404):
+                    raise
+                summary["skipped"] += 1
     except _OutOfTime:
         summary["timed_out"] = True
 
@@ -396,8 +349,6 @@ def _build_embed(stats, summary, days):
     footer = f"{summary['channels']} チャンネル・{summary['messages']} 件のメッセージを集計"
     if summary["skipped"]:
         footer += f"／取得不可 {summary['skipped']} チャンネル"
-    if summary.get("archive_sources_skipped"):
-        footer += f"／取得不可 {summary['archive_sources_skipped']} アーカイブ一覧"
     if summary["timed_out"]:
         footer += "／⚠ 時間切れのため一部のチャンネルは未集計"
 

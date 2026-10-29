@@ -1,0 +1,7 @@
+aws_region         = "ap-northeast-1"
+guild_id           = "<DISCORD_SERVER_ID>"
+discord_public_key = "<APPLICATION_PUBLIC_KEY_HEX>"
+
+# Optional overrides (defaults shown in variables.tf):
+# function_name       = "emoji-stats"
+# ssm_param_bot_token = "/emoji-stats/discord-bot-token"

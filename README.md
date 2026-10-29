@@ -6,3 +6,4 @@
 ## ボット一覧
 
 - [x-to-discord](./x-to-discord/) — 固定のXアカウントの新規ポストをDiscordチャンネルへ転送するボット。
+- [emoji-stats](./emoji-stats/) — `/emoji-stats` でサーバーのカスタム絵文字の使用率を返すボット。

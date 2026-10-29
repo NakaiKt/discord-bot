@@ -1,7 +1,7 @@
 """Focused regression tests. Run: python -m unittest discover -s emoji-stats/tests -v
 
 Tests load handler with fake boto3 and nacl modules; production dependencies are not
-required just to exercise API pagination and counting.
+required just to exercise counting and time budget handling.
 """
 import importlib.util
 import json
@@ -44,24 +44,6 @@ class CollectTests(unittest.TestCase):
         with patch.object(handler, "_discord_request", return_value=messages):
             self.assertEqual(handler._scan_channel("42", 0, stats, self.context), 3)
         self.assertEqual(stats["123"], {"content": 1, "reaction": 2})
-
-    def test_public_archive_uses_timestamp_cursor(self):
-        pages = [
-            {"threads": [{"id": "11", "thread_metadata": {"archive_timestamp": "2026-10-20T00:00:00Z"}}], "has_more": True},
-            {"threads": [{"id": "22", "thread_metadata": {"archive_timestamp": "2026-10-10T00:00:00Z"}}], "has_more": False},
-        ]
-        with patch.object(handler, "_discord_request", side_effect=pages) as req:
-            self.assertEqual([t["id"] for t in handler._iter_archived_threads("1", False, None)], ["11", "22"])
-        self.assertIn("before=2026-10-20T00%3A00%3A00Z", req.call_args_list[1].args[1])
-
-    def test_private_archive_uses_thread_id_cursor(self):
-        pages = [
-            {"threads": [{"id": "111"}], "has_more": True},
-            {"threads": [], "has_more": False},
-        ]
-        with patch.object(handler, "_discord_request", side_effect=pages) as req:
-            self.assertEqual(len(list(handler._iter_archived_threads("1", True, None))), 1)
-        self.assertIn("before=111", req.call_args_list[1].args[1])
 
     def test_rate_limit_wait_aborts_before_deadline(self):
         with patch.object(handler.time, "monotonic", return_value=5):

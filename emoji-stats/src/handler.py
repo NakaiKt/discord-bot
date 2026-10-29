@@ -44,9 +44,10 @@ READABLE_CHANNEL_TYPES = {0, 2, 5, 13}
 CUSTOM_EMOJI = re.compile(r"<a?:\w+:(\d+)>")
 DISCORD_EPOCH_MS = 1420070400000
 
-# Stop crawling with this much Lambda time left, so the partial result can still be posted.
-# The interaction token is valid for 15 minutes, the same as the Lambda timeout ceiling.
+# Stop crawling this long before the earlier of the Lambda timeout and the 15-minute
+# interaction token expiry, so the partial result can still be posted.
 TIME_RESERVE_MS = 60_000
+INTERACTION_TOKEN_TTL_SECONDS = 900
 
 TOP_N = 25
 EMBED_DESCRIPTION_LIMIT = 4096
@@ -205,7 +206,10 @@ def _discord_request(method, path, body=None, authenticated=True, stop_at=None):
                 payload = response.read()
                 if response.headers.get("X-RateLimit-Remaining") == "0":
                     delay = float(response.headers.get("X-RateLimit-Reset-After") or 1)
-                    _sleep_with_deadline(delay, stop_at)
+                    # Never discard a page already read: if the wait does not fit, skip it and
+                    # let the next request's deadline check stop the crawl.
+                    if stop_at is None or delay < stop_at - time.monotonic():
+                        time.sleep(delay)
                 return json.loads(payload) if payload else None
         except urllib.error.HTTPError as error:
             if error.code != 429 or attempt == RATE_LIMIT_MAX_ATTEMPTS:
@@ -220,6 +224,12 @@ def _discord_request(method, path, body=None, authenticated=True, stop_at=None):
             safe_path = "/webhooks/[redacted]" if path.startswith("/webhooks/") else path.split("?")[0]
             logger.warning("Rate limited on %s %s; retrying in %ss", method, safe_path, retry_after)
             _sleep_with_deadline(max(0.0, retry_after), stop_at)
+        except (urllib.error.URLError, TimeoutError):
+            # The socket timeout is clipped to the deadline, so a timeout at the deadline is
+            # "out of time" (partial result), not a failure of the whole run.
+            if stop_at is not None and time.monotonic() >= stop_at:
+                raise _OutOfTime()
+            raise
     raise RuntimeError("unreachable")
 
 
@@ -227,18 +237,11 @@ def _snowflake_ms(snowflake):
     return (int(snowflake) >> 22) + DISCORD_EPOCH_MS
 
 
-def _has_time(context):
-    return context.get_remaining_time_in_millis() > TIME_RESERVE_MS
-
-
-def _scan_channel(channel_id, cutoff_ms, stats, context, stop_at=None):
+def _scan_channel(channel_id, cutoff_ms, stats, stop_at):
     """Count custom emoji on messages posted within the window (not reaction events)."""
     scanned = 0
     before = None
     while True:
-        if not _has_time(context):
-            raise _OutOfTime()
-        _check_deadline(stop_at)
         query = {"limit": 100}
         if before:
             query["before"] = before
@@ -269,7 +272,7 @@ def _scan_channel(channel_id, cutoff_ms, stats, context, stop_at=None):
         before = messages[-1]["id"]
 
 
-def _aggregate(guild_id, days, context, stop_at=None):
+def _aggregate(guild_id, days, stop_at):
     emojis = _discord_request("GET", f"/guilds/{guild_id}/emojis", stop_at=stop_at)
     stats = {emoji["id"]: {"emoji": emoji, "content": 0, "reaction": 0} for emoji in emojis}
     guild_channels = _discord_request("GET", f"/guilds/{guild_id}/channels", stop_at=stop_at)
@@ -288,13 +291,16 @@ def _aggregate(guild_id, days, context, stop_at=None):
             if last_id and _snowflake_ms(last_id) < cutoff_ms:
                 continue
             try:
-                summary["messages"] += _scan_channel(
-                    channel["id"], cutoff_ms, stats, context, stop_at=stop_at
-                )
+                summary["messages"] += _scan_channel(channel["id"], cutoff_ms, stats, stop_at)
                 summary["channels"] += 1
             except urllib.error.HTTPError as error:
-                if error.code not in (403, 404):
+                # 401 means a wrong bot token: every channel would fail, so fail the run.
+                if error.code == 401:
                     raise
+                # 403/404 (no permission) or a transient 5xx/429: skip just this channel.
+                summary["skipped"] += 1
+            except (urllib.error.URLError, TimeoutError):
+                # One network hiccup should not throw away every other channel's counts.
                 summary["skipped"] += 1
     except _OutOfTime:
         summary["timed_out"] = True
@@ -363,12 +369,13 @@ def _handle_collect(event, context):
     days = int(event["days"])
     started = time.time()
     try:
-        # Stop scanning before both the Lambda timeout and the 15-minute token expiry.
-        remaining = context.get_remaining_time_in_millis() / 1000
-        token_remaining = float(event.get("accepted_at", time.time())) + 900 - time.time()
-        scan_seconds = max(0.0, min(remaining, token_remaining) - TIME_RESERVE_MS / 1000)
+        # The token clock starts at acceptance, so time spent in the async queue counts too.
+        lambda_remaining = context.get_remaining_time_in_millis() / 1000
+        accepted_at = float(event.get("accepted_at", time.time()))
+        token_remaining = accepted_at + INTERACTION_TOKEN_TTL_SECONDS - time.time()
+        scan_seconds = max(0.0, min(lambda_remaining, token_remaining) - TIME_RESERVE_MS / 1000)
         stop_at = time.monotonic() + scan_seconds
-        stats, summary = _aggregate(os.environ["GUILD_ID"], days, context, stop_at=stop_at)
+        stats, summary = _aggregate(os.environ["GUILD_ID"], days, stop_at)
         payload = {
             "content": "",
             "embeds": [_build_embed(stats, summary, days)],

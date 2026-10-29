@@ -100,7 +100,9 @@ resource "aws_lambda_function" "this" {
   # Lambda's ceiling, matching the 15-minute life of the interaction token. The handler
   # stops crawling a minute early so a partial result is still delivered.
   timeout          = 900
-  memory_size      = 128
+  # Lambda CPU scales with memory; 256 MB shortens the cold start (boto3 + PyNaCl import)
+  # that must fit Discord's 3-second reply window. The cost difference is negligible here.
+  memory_size      = 256
   filename         = data.archive_file.lambda.output_path
   source_code_hash = data.archive_file.lambda.output_base64sha256
 

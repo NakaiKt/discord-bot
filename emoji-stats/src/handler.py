@@ -44,9 +44,10 @@ READABLE_CHANNEL_TYPES = {0, 2, 5, 13}
 CUSTOM_EMOJI = re.compile(r"<a?:\w+:(\d+)>")
 DISCORD_EPOCH_MS = 1420070400000
 
-# Stop crawling with this much Lambda time left, so the partial result can still be posted.
-# The interaction token is valid for 15 minutes, the same as the Lambda timeout ceiling.
+# Stop crawling this long before the earlier of the Lambda timeout and the 15-minute
+# interaction token expiry, so the partial result can still be posted.
 TIME_RESERVE_MS = 60_000
+INTERACTION_TOKEN_TTL_SECONDS = 900
 
 TOP_N = 25
 EMBED_DESCRIPTION_LIMIT = 4096
@@ -84,22 +85,24 @@ def _http_response(status, body):
 
 
 def _verified_body(event):
-    """Return the raw request body when Discord's Ed25519 signature is valid, else None."""
+    """Return the raw body only for a recent, correctly signed Discord request."""
     headers = {key.lower(): value for key, value in (event.get("headers") or {}).items()}
     signature = headers.get("x-signature-ed25519")
     timestamp = headers.get("x-signature-timestamp")
     if not signature or not timestamp:
         return None
 
-    body = event.get("body") or ""
-    raw = base64.b64decode(body) if event.get("isBase64Encoded") else body.encode("utf-8")
-
     try:
+        # A signature proves authenticity, not freshness; reject replayed requests.
+        if abs(time.time() - int(timestamp)) > 300:
+            return None
+        body = event.get("body") or ""
+        raw = base64.b64decode(body, validate=True) if event.get("isBase64Encoded") else body.encode("utf-8")
         verify_key = VerifyKey(bytes.fromhex(os.environ["DISCORD_PUBLIC_KEY"]))
         verify_key.verify(timestamp.encode("utf-8") + raw, bytes.fromhex(signature))
-    except (BadSignatureError, ValueError):
+        return raw
+    except (BadSignatureError, ValueError, TypeError, UnicodeError):
         return None
-    return raw
 
 
 def _ephemeral_message(content):
@@ -144,6 +147,7 @@ def _handle_interaction(event, context):
                 "application_id": interaction["application_id"],
                 "interaction_token": interaction["token"],
                 "days": days,
+                "accepted_at": time.time(),
             }
         ).encode("utf-8"),
     )
@@ -172,7 +176,18 @@ def _bot_token():
     return _bot_token_cache
 
 
-def _discord_request(method, path, body=None, authenticated=True):
+def _check_deadline(stop_at):
+    if stop_at is not None and time.monotonic() >= stop_at:
+        raise _OutOfTime()
+
+
+def _sleep_with_deadline(seconds, stop_at):
+    if stop_at is not None and seconds >= stop_at - time.monotonic():
+        raise _OutOfTime()
+    time.sleep(seconds)
+
+
+def _discord_request(method, path, body=None, authenticated=True, stop_at=None):
     headers = {"User-Agent": USER_AGENT}
     if authenticated:
         headers["Authorization"] = f"Bot {_bot_token()}"
@@ -182,13 +197,19 @@ def _discord_request(method, path, body=None, authenticated=True):
         data = json.dumps(body).encode("utf-8")
 
     for attempt in range(1, RATE_LIMIT_MAX_ATTEMPTS + 1):
+        _check_deadline(stop_at)
+        remaining = stop_at - time.monotonic() if stop_at is not None else REQUEST_TIMEOUT
+        timeout = min(REQUEST_TIMEOUT, max(0.1, remaining))
         request = urllib.request.Request(DISCORD_API + path, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 payload = response.read()
-                # Pace ourselves before the bucket runs dry instead of eating a 429.
                 if response.headers.get("X-RateLimit-Remaining") == "0":
-                    time.sleep(float(response.headers.get("X-RateLimit-Reset-After") or 1))
+                    delay = float(response.headers.get("X-RateLimit-Reset-After") or 1)
+                    # Never discard a page already read: if the wait does not fit, skip it and
+                    # let the next request's deadline check stop the crawl.
+                    if stop_at is None or delay < stop_at - time.monotonic():
+                        time.sleep(delay)
                 return json.loads(payload) if payload else None
         except urllib.error.HTTPError as error:
             if error.code != 429 or attempt == RATE_LIMIT_MAX_ATTEMPTS:
@@ -197,9 +218,18 @@ def _discord_request(method, path, body=None, authenticated=True):
                 retry_after = float(json.loads(error.read()).get("retry_after", 1))
             except (ValueError, AttributeError):
                 retry_after = 1.0
-            error.close()
-            logger.warning("Rate limited on %s %s; retrying in %ss", method, path, retry_after)
-            time.sleep(retry_after)
+            finally:
+                error.close()
+            # Never log a webhook URL containing the short-lived interaction token.
+            safe_path = "/webhooks/[redacted]" if path.startswith("/webhooks/") else path.split("?")[0]
+            logger.warning("Rate limited on %s %s; retrying in %ss", method, safe_path, retry_after)
+            _sleep_with_deadline(max(0.0, retry_after), stop_at)
+        except (urllib.error.URLError, TimeoutError):
+            # The socket timeout is clipped to the deadline, so a timeout at the deadline is
+            # "out of time" (partial result), not a failure of the whole run.
+            if stop_at is not None and time.monotonic() >= stop_at:
+                raise _OutOfTime()
+            raise
     raise RuntimeError("unreachable")
 
 
@@ -207,36 +237,31 @@ def _snowflake_ms(snowflake):
     return (int(snowflake) >> 22) + DISCORD_EPOCH_MS
 
 
-def _has_time(context):
-    return context.get_remaining_time_in_millis() > TIME_RESERVE_MS
-
-
-def _scan_channel(channel_id, cutoff_ms, stats, context):
-    """Count emoji in one channel's messages newer than cutoff. Returns the message count."""
+def _scan_channel(channel_id, cutoff_ms, stats, stop_at):
+    """Count custom emoji on messages posted within the window (not reaction events)."""
     scanned = 0
     before = None
     while True:
-        if not _has_time(context):
-            raise _OutOfTime()
         query = {"limit": 100}
         if before:
             query["before"] = before
         messages = _discord_request(
-            "GET", f"/channels/{channel_id}/messages?{urllib.parse.urlencode(query)}"
+            "GET", f"/channels/{channel_id}/messages?{urllib.parse.urlencode(query)}",
+            stop_at=stop_at,
         )
         if not messages:
             return scanned
 
-        # Messages come newest-first, so the first one older than cutoff ends the channel.
         for message in messages:
             if _snowflake_ms(message["id"]) < cutoff_ms:
                 return scanned
             scanned += 1
-            # Bots' text is not "usage"; reactions on bot posts (e.g. forwarded X posts) are.
-            if not message.get("author", {}).get("bot"):
-                for emoji_id in CUSTOM_EMOJI.findall(message.get("content", "")):
+            author = message.get("author", {})
+            if not author.get("bot") and not message.get("webhook_id"):
+                for emoji_id in CUSTOM_EMOJI.findall(message.get("content") or ""):
                     if emoji_id in stats:
                         stats[emoji_id]["content"] += 1
+            # Discord returns current reaction counts, without per-reaction timestamps.
             for reaction in message.get("reactions", []):
                 emoji_id = reaction.get("emoji", {}).get("id")
                 if emoji_id in stats:
@@ -247,37 +272,38 @@ def _scan_channel(channel_id, cutoff_ms, stats, context):
         before = messages[-1]["id"]
 
 
-def _aggregate(guild_id, days, context):
-    emojis = _discord_request("GET", f"/guilds/{guild_id}/emojis")
+def _aggregate(guild_id, days, stop_at):
+    emojis = _discord_request("GET", f"/guilds/{guild_id}/emojis", stop_at=stop_at)
     stats = {emoji["id"]: {"emoji": emoji, "content": 0, "reaction": 0} for emoji in emojis}
-
-    channels = [
-        channel
-        for channel in _discord_request("GET", f"/guilds/{guild_id}/channels")
-        if channel.get("type") in READABLE_CHANNEL_TYPES
-    ]
-    threads = _discord_request("GET", f"/guilds/{guild_id}/threads/active").get("threads", [])
+    guild_channels = _discord_request("GET", f"/guilds/{guild_id}/channels", stop_at=stop_at)
+    channels = [c for c in guild_channels if c.get("type") in READABLE_CHANNEL_TYPES]
+    active_threads = _discord_request(
+        "GET", f"/guilds/{guild_id}/threads/active", stop_at=stop_at
+    ).get("threads", [])
 
     cutoff_ms = int(time.time() * 1000) - days * 86_400_000
     summary = {"channels": 0, "messages": 0, "skipped": 0, "timed_out": False}
 
-    for channel in channels + threads:
-        last_message_id = channel.get("last_message_id")
-        # Nothing posted in the window: skip without spending a request.
-        if not last_message_id or _snowflake_ms(last_message_id) < cutoff_ms:
-            continue
-        try:
-            summary["messages"] += _scan_channel(channel["id"], cutoff_ms, stats, context)
-            summary["channels"] += 1
-        except _OutOfTime:
-            summary["timed_out"] = True
-            break
-        except urllib.error.HTTPError as error:
-            if error.code in (403, 404):
-                # No View Channel / Read Message History permission there.
-                summary["skipped"] += 1
+    try:
+        for channel in channels + active_threads:
+            # An absent last_message_id does not prove there is no recent history.
+            last_id = channel.get("last_message_id")
+            if last_id and _snowflake_ms(last_id) < cutoff_ms:
                 continue
-            raise
+            try:
+                summary["messages"] += _scan_channel(channel["id"], cutoff_ms, stats, stop_at)
+                summary["channels"] += 1
+            except urllib.error.HTTPError as error:
+                # 401 means a wrong bot token: every channel would fail, so fail the run.
+                if error.code == 401:
+                    raise
+                # 403/404 (no permission) or a transient 5xx/429: skip just this channel.
+                summary["skipped"] += 1
+            except (urllib.error.URLError, TimeoutError):
+                # One network hiccup should not throw away every other channel's counts.
+                summary["skipped"] += 1
+    except _OutOfTime:
+        summary["timed_out"] = True
 
     return stats, summary
 
@@ -328,7 +354,7 @@ def _build_embed(stats, summary, days):
 
     footer = f"{summary['channels']} チャンネル・{summary['messages']} 件のメッセージを集計"
     if summary["skipped"]:
-        footer += f"／閲覧権限がない {summary['skipped']} チャンネルはスキップ"
+        footer += f"／取得不可 {summary['skipped']} チャンネル"
     if summary["timed_out"]:
         footer += "／⚠ 時間切れのため一部のチャンネルは未集計"
 
@@ -343,7 +369,13 @@ def _handle_collect(event, context):
     days = int(event["days"])
     started = time.time()
     try:
-        stats, summary = _aggregate(os.environ["GUILD_ID"], days, context)
+        # The token clock starts at acceptance, so time spent in the async queue counts too.
+        lambda_remaining = context.get_remaining_time_in_millis() / 1000
+        accepted_at = float(event.get("accepted_at", time.time()))
+        token_remaining = accepted_at + INTERACTION_TOKEN_TTL_SECONDS - time.time()
+        scan_seconds = max(0.0, min(lambda_remaining, token_remaining) - TIME_RESERVE_MS / 1000)
+        stop_at = time.monotonic() + scan_seconds
+        stats, summary = _aggregate(os.environ["GUILD_ID"], days, stop_at)
         payload = {
             "content": "",
             "embeds": [_build_embed(stats, summary, days)],

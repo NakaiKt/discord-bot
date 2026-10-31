@@ -11,6 +11,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import time
 import types
@@ -323,70 +324,81 @@ class EmbedTests(unittest.TestCase):
             for i, total in enumerate(totals)
         }
 
-    def body(self, embeds):
-        return "\n".join(embed["description"] for embed in embeds)
+    def build(self, totals, order, summary=None, name_length=8):
+        return handler._build_embed(self.stats(totals, name_length), summary or self.SUMMARY, 30, order)
 
-    def assert_within_discord_limits(self, embeds):
-        self.assertLessEqual(len(embeds), 10)
-        for embed in embeds:
-            self.assertTrue(embed["description"].strip())
-            self.assertLessEqual(len(embed["description"]), handler.EMBED_DESCRIPTION_LIMIT)
-        total = sum(
-            len(embed.get("title", "")) + len(embed["description"]) + len(embed.get("footer", {}).get("text", ""))
-            for embed in embeds
+    def body(self, embed):
+        return "\n".join([embed["description"]] + [field["value"] for field in embed.get("fields", [])])
+
+    def assert_within_discord_limits(self, embed):
+        fields = embed.get("fields", [])
+        self.assertLessEqual(len(fields), 25)
+        self.assertTrue(embed["description"].strip())
+        self.assertLessEqual(len(embed["description"]), handler.EMBED_DESCRIPTION_LIMIT)
+        for field in fields:
+            self.assertTrue(field["name"] and field["value"].strip())
+            self.assertLessEqual(len(field["value"]), handler.FIELD_VALUE_LIMIT)
+        total = len(embed["title"]) + len(embed["description"]) + len(embed["footer"]["text"]) + sum(
+            len(field["name"]) + len(field["value"]) for field in fields
         )
         self.assertLessEqual(total, handler.MESSAGE_EMBED_CHAR_LIMIT)
 
+    def test_ranks_are_not_markdown_list_items(self):
+        # Discord renumbers "N." lines as an ordered list, so ranks must not use that form.
+        body = self.body(self.build(range(60, 0, -1), "bottom"))
+        self.assertIsNone(re.search(r"^\d+\. ", body, re.MULTILINE))
+
     def test_top_lists_used_only_most_used_first(self):
-        embeds = handler._build_embeds(self.stats([0, 5, 2, 9]), self.SUMMARY, 30, "top")
-        body = self.body(embeds)
-        self.assertIn("上位", embeds[0]["title"])
+        embed = self.build([0, 5, 2, 9], "top")
+        body = self.body(embed)
+        self.assertIn("上位", embed["title"])
         self.assertIn("計 **16** 回", body)
-        self.assertLess(body.index("e003"), body.index("e001"))
-        self.assertLess(body.index("e001"), body.index("e002"))
+        self.assertIn("1位　<:e003", body)
+        self.assertIn("2位　<:e001", body)
+        self.assertIn("3位　<:e002", body)
         self.assertNotIn("e000", body)  # unused never appears in top
         self.assertNotIn("未使用", body)
         self.assertNotIn("…ほか", body)
-        self.assertIn("取得不可 1", embeds[-1]["footer"]["text"])
+        self.assertIn("取得不可 1", embed["footer"]["text"])
 
-    def test_bottom_lists_unused_then_least_used(self):
-        embeds = handler._build_embeds(self.stats([0, 5, 2, 9, 0]), self.SUMMARY, 30, "bottom")
-        body = self.body(embeds)
-        self.assertIn("下位", embeds[0]["title"])
+    def test_bottom_lists_unused_then_least_used_with_real_ranks(self):
+        embed = self.build([0, 5, 2, 9, 0], "bottom")
+        body = self.body(embed)
+        self.assertIn("下位", embed["title"])
         self.assertIn("**未使用 2 個**", body)
         positions = [body.index(name) for name in ("e000", "e004", "e002", "e001", "e003")]
         self.assertEqual(positions, sorted(positions))
-        # Ranks are the real ranks, so the least used shows the last rank number.
-        self.assertIn("3. <:e002", body)
+        # Least used first, carrying its real (lowest) rank: 3位, 2位, 1位.
+        ranks = re.findall(r"^(\d+)位", body, re.MULTILINE)
+        self.assertEqual(ranks, ["3", "2", "1"])
 
-    def test_top_fills_one_message_and_counts_the_rest(self):
-        embeds = handler._build_embeds(self.stats(range(500, 0, -1), name_length=32), self.SUMMARY, 90, "top")
-        self.assert_within_discord_limits(embeds)
-        body = self.body(embeds)
-        shown = body.count(" 回 (")
-        self.assertGreater(shown, 40)  # well beyond the old 25-row cut-off
+    def test_one_card_holds_more_than_a_description(self):
+        embed = self.build(range(500, 0, -1), "top", name_length=32)
+        self.assert_within_discord_limits(embed)
+        body = self.body(embed)
+        shown = len(re.findall(r"^\d+位", body, re.MULTILINE))
+        self.assertIn("fields", embed)  # spilled past 4096 chars, still one card
+        self.assertGreater(shown, 40)
         self.assertIn(f"…ほか {500 - shown} 個は省略", body)
-        self.assertGreater(len(embeds), 1)  # spills into a second embed of the same message
+        ranks = [int(rank) for rank in re.findall(r"^(\d+)位", body, re.MULTILINE)]
+        self.assertEqual(ranks, list(range(1, shown + 1)))  # continuous across description and fields
 
     def test_bottom_with_many_unused_still_fits(self):
-        embeds = handler._build_embeds(self.stats([0] * 400 + [1, 2]), self.SUMMARY, 30, "bottom")
-        self.assert_within_discord_limits(embeds)
-        body = self.body(embeds)
+        embed = self.build([0] * 400 + [1, 2], "bottom")
+        self.assert_within_discord_limits(embed)
+        body = self.body(embed)
         self.assertIn("**未使用 400 個**", body)
         self.assertRegex(body, r"…ほか \d+ 個は省略$")
         self.assertNotIn("使用回数が少ない順", body)  # no orphan heading without rows
 
     def test_no_emoji_and_nothing_used(self):
-        self.assertIn("ありません", self.body(handler._build_embeds({}, self.SUMMARY, 30, "top")))
-        body = self.body(handler._build_embeds(self.stats([0, 0]), self.SUMMARY, 30, "top"))
-        self.assertIn("使われたカスタム絵文字はありません", body)
-        body = self.body(handler._build_embeds(self.stats([0, 0]), self.SUMMARY, 30, "bottom"))
-        self.assertIn("**未使用 2 個**", body)
+        self.assertIn("ありません", self.body(handler._build_embed({}, self.SUMMARY, 30, "top")))
+        self.assertIn("使われたカスタム絵文字はありません", self.body(self.build([0, 0], "top")))
+        self.assertIn("**未使用 2 個**", self.body(self.build([0, 0], "bottom")))
 
     def test_timeout_footer(self):
-        summary = dict(self.SUMMARY, timed_out=True)
-        embeds = handler._build_embeds(self.stats([1]), summary, 30, "top")
-        self.assertIn("時間切れ", embeds[-1]["footer"]["text"])
+        embed = self.build([1], "top", summary=dict(self.SUMMARY, timed_out=True))
+        self.assertIn("時間切れ", embed["footer"]["text"])
 
 
 if __name__ == "__main__":

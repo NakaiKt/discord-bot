@@ -55,6 +55,8 @@ ORDER_BOTTOM = "bottom"
 # Discord rejects a message whose embeds exceed these. The total covers every embed's
 # title, description and footer together; the margin absorbs counting differences.
 EMBED_DESCRIPTION_LIMIT = 4096
+FIELD_VALUE_LIMIT = 1024
+BLANK_FIELD_NAME = "​"  # field names are required; a zero-width space shows nothing
 MESSAGE_EMBED_CHAR_LIMIT = 6000
 MESSAGE_CHAR_MARGIN = 100
 UNUSED_PER_LINE = 8
@@ -340,7 +342,9 @@ def _body_items(stats, order):
 
     ranked = [
         (
-            f"{rank}. {_emoji_mention(row['emoji'])} **{_total(row)}** 回 "
+            # "N位" rather than "N.": Discord renders "N." lines as a Markdown ordered list
+            # and renumbers them upward from the first number, which garbles the ranks.
+            f"{rank}位　{_emoji_mention(row['emoji'])} **{_total(row)}** 回 "
             f"({_total(row) / grand_total * 100:.1f}%)"
             f"　本文 {row['content']} / リアクション {row['reaction']}",
             1,
@@ -367,24 +371,25 @@ def _body_items(stats, order):
     return header, items
 
 
-def _split_descriptions(lines):
-    """Join lines into embed descriptions of at most EMBED_DESCRIPTION_LIMIT characters."""
-    descriptions = []
+def _split_chunks(lines):
+    """Join lines into one description (<= 4096 chars) followed by field values (<= 1024)."""
+    chunks = []
     current = ""
     for line in lines:
+        limit = FIELD_VALUE_LIMIT if chunks else EMBED_DESCRIPTION_LIMIT
         candidate = f"{current}\n{line}" if current else line
-        if len(candidate) > EMBED_DESCRIPTION_LIMIT:
-            descriptions.append(current)
+        if len(candidate) > limit:
+            chunks.append(current)
             current = line
         else:
             current = candidate
-    descriptions.append(current)
-    # An embed description cannot be blank (e.g. a split right at an empty line).
-    return [description for description in descriptions if description.strip()]
+    chunks.append(current)
+    # Discord rejects a blank description or field value (e.g. a split at an empty line).
+    return [chunk.strip("\n") for chunk in chunks if chunk.strip()]
 
 
-def _build_embeds(stats, summary, days, order):
-    """Fill one message with as many emoji as fit, in the requested order."""
+def _build_embed(stats, summary, days, order):
+    """Fill one embed (one card) with as many emoji as fit, in the requested order."""
     label = "下位" if order == ORDER_BOTTOM else "上位"
     title = f"カスタム絵文字の使用率（直近 {days} 日・{label}）"
 
@@ -418,10 +423,13 @@ def _build_embeds(stats, summary, days, order):
     if omitted:
         lines.append(f"…ほか {omitted} 個は省略")
 
-    embeds = [{"description": description} for description in _split_descriptions(lines)]
-    embeds[0]["title"] = title
-    embeds[-1]["footer"] = {"text": footer}
-    return embeds
+    # Several embeds would render as separate cards, so text beyond the description goes
+    # into untitled fields of the same embed; the message-wide 6000-char cap still applies.
+    description, *rest = _split_chunks(lines)
+    embed = {"title": title, "description": description, "footer": {"text": footer}}
+    if rest:
+        embed["fields"] = [{"name": BLANK_FIELD_NAME, "value": value} for value in rest]
+    return embed
 
 
 def _handle_collect(event, context):
@@ -437,7 +445,7 @@ def _handle_collect(event, context):
         stats, summary = _aggregate(os.environ["GUILD_ID"], days, stop_at)
         payload = {
             "content": "",
-            "embeds": _build_embeds(stats, summary, days, event.get("order", ORDER_TOP)),
+            "embeds": [_build_embed(stats, summary, days, event.get("order", ORDER_TOP))],
             "allowed_mentions": {"parse": []},
         }
         logger.info("Collect completed in %.1fs: %s", time.time() - started, summary)

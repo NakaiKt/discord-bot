@@ -115,18 +115,23 @@ class InteractionTests(unittest.TestCase):
         self.assertEqual((status, body["type"], body["data"]["flags"]), (200, 4, 64))
         handler.lambda_client.invoke.assert_not_called()
 
-    def test_defers_ephemerally_and_starts_async_crawl(self):
+    def test_defers_publicly_and_starts_async_crawl(self):
         status, body = self.call(self.url_event(self.command(options=[{"name": "days", "value": 500}])))
-        self.assertEqual((status, body), (200, {"type": 5, "data": {"flags": 64}}))
+        self.assertEqual((status, body), (200, {"type": 5, "data": {}}))
         kwargs = handler.lambda_client.invoke.call_args.kwargs
         self.assertEqual(kwargs["InvocationType"], "Event")
         payload = json.loads(kwargs["Payload"])
-        self.assertEqual((payload["action"], payload["days"], payload["interaction_token"]), ("collect", 90, "tok"))
+        self.assertEqual(
+            (payload["action"], payload["days"], payload["order"], payload["interaction_token"]),
+            ("collect", 90, "top", "tok"),
+        )
         self.assertAlmostEqual(payload["accepted_at"], time.time(), delta=5)
 
-    def test_public_option_defers_visibly(self):
-        _, body = self.call(self.url_event(self.command(options=[{"name": "public", "value": True}])))
-        self.assertEqual(body, {"type": 5, "data": {}})
+    def test_order_option_is_passed_and_unknown_values_fall_back_to_top(self):
+        for value, expected in (("bottom", "bottom"), ("top", "top"), ("weird", "top")):
+            self.call(self.url_event(self.command(options=[{"name": "order", "value": value}])))
+            payload = json.loads(handler.lambda_client.invoke.call_args.kwargs["Payload"])
+            self.assertEqual(payload["order"], expected)
 
     def test_collect_payload_through_url_is_not_trusted(self):
         # A body shaped like the internal event still goes through signature verification.
@@ -305,16 +310,83 @@ class RequestTests(unittest.TestCase):
 
 
 class EmbedTests(unittest.TestCase):
-    def test_description_fits_discord_limit(self):
-        stats = {
-            str(i): {"emoji": {"id": str(i), "name": f"emoji_name_{i:03d}"}, "content": i % 3, "reaction": 0}
-            for i in range(250)
+    SUMMARY = {"channels": 3, "messages": 120, "skipped": 1, "timed_out": False}
+
+    def stats(self, totals, name_length=8):
+        """One emoji per total; emoji i is named e{i} padded to name_length."""
+        return {
+            str(1000 + i): {
+                "emoji": {"id": str(1000 + i), "name": f"e{i:03d}".ljust(name_length, "x")},
+                "content": total,
+                "reaction": 0,
+            }
+            for i, total in enumerate(totals)
         }
-        summary = {"channels": 1, "messages": 1, "skipped": 1, "timed_out": True}
-        embed = handler._build_embed(stats, summary, 30)
-        self.assertLessEqual(len(embed["description"]), handler.EMBED_DESCRIPTION_LIMIT)
-        self.assertIn("…ほか", embed["description"])
-        self.assertIn("時間切れ", embed["footer"]["text"])
+
+    def body(self, embeds):
+        return "\n".join(embed["description"] for embed in embeds)
+
+    def assert_within_discord_limits(self, embeds):
+        self.assertLessEqual(len(embeds), 10)
+        for embed in embeds:
+            self.assertTrue(embed["description"].strip())
+            self.assertLessEqual(len(embed["description"]), handler.EMBED_DESCRIPTION_LIMIT)
+        total = sum(
+            len(embed.get("title", "")) + len(embed["description"]) + len(embed.get("footer", {}).get("text", ""))
+            for embed in embeds
+        )
+        self.assertLessEqual(total, handler.MESSAGE_EMBED_CHAR_LIMIT)
+
+    def test_top_lists_used_only_most_used_first(self):
+        embeds = handler._build_embeds(self.stats([0, 5, 2, 9]), self.SUMMARY, 30, "top")
+        body = self.body(embeds)
+        self.assertIn("上位", embeds[0]["title"])
+        self.assertIn("計 **16** 回", body)
+        self.assertLess(body.index("e003"), body.index("e001"))
+        self.assertLess(body.index("e001"), body.index("e002"))
+        self.assertNotIn("e000", body)  # unused never appears in top
+        self.assertNotIn("未使用", body)
+        self.assertNotIn("…ほか", body)
+        self.assertIn("取得不可 1", embeds[-1]["footer"]["text"])
+
+    def test_bottom_lists_unused_then_least_used(self):
+        embeds = handler._build_embeds(self.stats([0, 5, 2, 9, 0]), self.SUMMARY, 30, "bottom")
+        body = self.body(embeds)
+        self.assertIn("下位", embeds[0]["title"])
+        self.assertIn("**未使用 2 個**", body)
+        positions = [body.index(name) for name in ("e000", "e004", "e002", "e001", "e003")]
+        self.assertEqual(positions, sorted(positions))
+        # Ranks are the real ranks, so the least used shows the last rank number.
+        self.assertIn("3. <:e002", body)
+
+    def test_top_fills_one_message_and_counts_the_rest(self):
+        embeds = handler._build_embeds(self.stats(range(500, 0, -1), name_length=32), self.SUMMARY, 90, "top")
+        self.assert_within_discord_limits(embeds)
+        body = self.body(embeds)
+        shown = body.count(" 回 (")
+        self.assertGreater(shown, 40)  # well beyond the old 25-row cut-off
+        self.assertIn(f"…ほか {500 - shown} 個は省略", body)
+        self.assertGreater(len(embeds), 1)  # spills into a second embed of the same message
+
+    def test_bottom_with_many_unused_still_fits(self):
+        embeds = handler._build_embeds(self.stats([0] * 400 + [1, 2]), self.SUMMARY, 30, "bottom")
+        self.assert_within_discord_limits(embeds)
+        body = self.body(embeds)
+        self.assertIn("**未使用 400 個**", body)
+        self.assertRegex(body, r"…ほか \d+ 個は省略$")
+        self.assertNotIn("使用回数が少ない順", body)  # no orphan heading without rows
+
+    def test_no_emoji_and_nothing_used(self):
+        self.assertIn("ありません", self.body(handler._build_embeds({}, self.SUMMARY, 30, "top")))
+        body = self.body(handler._build_embeds(self.stats([0, 0]), self.SUMMARY, 30, "top"))
+        self.assertIn("使われたカスタム絵文字はありません", body)
+        body = self.body(handler._build_embeds(self.stats([0, 0]), self.SUMMARY, 30, "bottom"))
+        self.assertIn("**未使用 2 個**", body)
+
+    def test_timeout_footer(self):
+        summary = dict(self.SUMMARY, timed_out=True)
+        embeds = handler._build_embeds(self.stats([1]), summary, 30, "top")
+        self.assertIn("時間切れ", embeds[-1]["footer"]["text"])
 
 
 if __name__ == "__main__":

@@ -33,10 +33,14 @@ COMMANDS = [
                 "required": False,
             },
             {
-                "type": 5,
-                "name": "public",
-                "description": "結果をチャンネルの全員に見せる（既定は自分だけ）",
+                "type": 3,
+                "name": "order",
+                "description": "表示する順位（既定: 上位）",
                 "required": False,
+                "choices": [
+                    {"name": "上位（使用回数が多い順）", "value": "top"},
+                    {"name": "下位（未使用 → 使用回数が少ない順）", "value": "bottom"},
+                ],
             },
         ],
     }

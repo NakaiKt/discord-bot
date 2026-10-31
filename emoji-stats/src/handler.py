@@ -49,8 +49,15 @@ DISCORD_EPOCH_MS = 1420070400000
 TIME_RESERVE_MS = 60_000
 INTERACTION_TOKEN_TTL_SECONDS = 900
 
-TOP_N = 25
+ORDER_TOP = "top"
+ORDER_BOTTOM = "bottom"
+
+# Discord rejects a message whose embeds exceed these. The total covers every embed's
+# title, description and footer together; the margin absorbs counting differences.
 EMBED_DESCRIPTION_LIMIT = 4096
+MESSAGE_EMBED_CHAR_LIMIT = 6000
+MESSAGE_CHAR_MARGIN = 100
+UNUSED_PER_LINE = 8
 
 _bot_token_cache = None
 
@@ -136,7 +143,7 @@ def _handle_interaction(event, context):
 
     options = {opt["name"]: opt["value"] for opt in interaction["data"].get("options", [])}
     days = min(max(int(options.get("days", DEFAULT_DAYS)), 1), MAX_DAYS)
-    public = bool(options.get("public", False))
+    order = ORDER_BOTTOM if options.get("order") == ORDER_BOTTOM else ORDER_TOP
 
     lambda_client.invoke(
         FunctionName=context.function_name,
@@ -147,16 +154,15 @@ def _handle_interaction(event, context):
                 "application_id": interaction["application_id"],
                 "interaction_token": interaction["token"],
                 "days": days,
+                "order": order,
                 "accepted_at": time.time(),
             }
         ).encode("utf-8"),
     )
-    logger.info("Accepted command: days=%s public=%s", days, public)
+    logger.info("Accepted command: days=%s order=%s", days, order)
 
-    # The deferred response decides the final visibility: ephemeral here means the edited
-    # result is ephemeral too.
-    data = {} if public else {"flags": FLAG_EPHEMERAL}
-    return _http_response(200, {"type": RESPONSE_DEFERRED_CHANNEL_MESSAGE, "data": data})
+    # No ephemeral flag: the result is posted to the channel for everyone.
+    return _http_response(200, {"type": RESPONSE_DEFERRED_CHANNEL_MESSAGE, "data": {}})
 
 
 # ---------------------------------------------------------------------------
@@ -313,44 +319,74 @@ def _emoji_mention(emoji):
     return f"<{prefix}:{emoji['name']}:{emoji['id']}>"
 
 
-def _build_embed(stats, summary, days):
-    rows = sorted(
-        stats.values(),
-        key=lambda row: row["content"] + row["reaction"],
-        reverse=True,
-    )
-    grand_total = sum(row["content"] + row["reaction"] for row in rows)
-    used = [row for row in rows if row["content"] + row["reaction"] > 0]
-    unused = [row for row in rows if row["content"] + row["reaction"] == 0]
+def _total(row):
+    return row["content"] + row["reaction"]
 
-    lines = []
+
+def _body_items(stats, order):
+    """Return (header lines, items). Each item is (line, number of emoji the line shows)."""
+    # Ties keep a stable order (by name) so repeated runs list them the same way.
+    rows = sorted(stats.values(), key=lambda row: row["emoji"]["name"])
+    used = sorted((row for row in rows if _total(row) > 0), key=_total, reverse=True)
+    unused = [row for row in rows if _total(row) == 0]
+
     if not rows:
-        lines.append("このサーバーにはカスタム絵文字がありません。")
-    else:
-        content_total = sum(row["content"] for row in rows)
-        reaction_total = sum(row["reaction"] for row in rows)
-        lines.append(f"計 **{grand_total}** 回（本文 {content_total} / リアクション {reaction_total}）")
-        lines.append("")
-        for rank, row in enumerate(used[:TOP_N], start=1):
-            total = row["content"] + row["reaction"]
-            share = total / grand_total * 100
-            lines.append(
-                f"{rank}. {_emoji_mention(row['emoji'])} **{total}** 回 ({share:.1f}%)"
-                f"　本文 {row['content']} / リアクション {row['reaction']}"
-            )
-        if len(used) > TOP_N:
-            lines.append(f"…ほか {len(used) - TOP_N} 個は使用あり")
+        return ["このサーバーにはカスタム絵文字がありません。"], []
 
-    description = "\n".join(lines)
+    grand_total = sum(_total(row) for row in used)
+    content_total = sum(row["content"] for row in used)
+    reaction_total = sum(row["reaction"] for row in used)
+    header = [f"計 **{grand_total}** 回（本文 {content_total} / リアクション {reaction_total}）", ""]
+
+    ranked = [
+        (
+            f"{rank}. {_emoji_mention(row['emoji'])} **{_total(row)}** 回 "
+            f"({_total(row) / grand_total * 100:.1f}%)"
+            f"　本文 {row['content']} / リアクション {row['reaction']}",
+            1,
+        )
+        for rank, row in enumerate(used, start=1)
+    ]
+
+    if order == ORDER_TOP:
+        if not ranked:
+            header.append("期間内に使われたカスタム絵文字はありません。")
+        return header, ranked
+
+    items = []
     if unused:
-        description += f"\n\n**未使用 {len(unused)} 個**\n"
-        for index, row in enumerate(unused):
-            mention = _emoji_mention(row["emoji"]) + " "
-            rest = f"…ほか {len(unused) - index} 個"
-            if len(description) + len(mention) + len(rest) > EMBED_DESCRIPTION_LIMIT:
-                description += rest
-                break
-            description += mention
+        items.append((f"**未使用 {len(unused)} 個**", 0))
+        for start in range(0, len(unused), UNUSED_PER_LINE):
+            chunk = unused[start : start + UNUSED_PER_LINE]
+            items.append((" ".join(_emoji_mention(row["emoji"]) for row in chunk), len(chunk)))
+    if ranked:
+        if items:
+            items.append(("", 0))
+        items.append(("**使用回数が少ない順**", 0))
+        items.extend(reversed(ranked))
+    return header, items
+
+
+def _split_descriptions(lines):
+    """Join lines into embed descriptions of at most EMBED_DESCRIPTION_LIMIT characters."""
+    descriptions = []
+    current = ""
+    for line in lines:
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > EMBED_DESCRIPTION_LIMIT:
+            descriptions.append(current)
+            current = line
+        else:
+            current = candidate
+    descriptions.append(current)
+    # An embed description cannot be blank (e.g. a split right at an empty line).
+    return [description for description in descriptions if description.strip()]
+
+
+def _build_embeds(stats, summary, days, order):
+    """Fill one message with as many emoji as fit, in the requested order."""
+    label = "下位" if order == ORDER_BOTTOM else "上位"
+    title = f"カスタム絵文字の使用率（直近 {days} 日・{label}）"
 
     footer = f"{summary['channels']} チャンネル・{summary['messages']} 件のメッセージを集計"
     if summary["skipped"]:
@@ -358,11 +394,34 @@ def _build_embed(stats, summary, days):
     if summary["timed_out"]:
         footer += "／⚠ 時間切れのため一部のチャンネルは未集計"
 
-    return {
-        "title": f"カスタム絵文字の使用率（直近 {days} 日）",
-        "description": description[:EMBED_DESCRIPTION_LIMIT],
-        "footer": {"text": footer},
-    }
+    header, items = _body_items(stats, order)
+    total_emoji = sum(count for _, count in items)
+    # Room is held back for the "…ほか" line in case it is needed.
+    tail_reserve = len(f"\n…ほか {total_emoji} 個は省略")
+    budget = MESSAGE_EMBED_CHAR_LIMIT - MESSAGE_CHAR_MARGIN - len(title) - len(footer) - tail_reserve
+
+    lines = list(header)
+    used_chars = sum(len(line) + 1 for line in lines)
+    shown_items = []
+    for line, count in items:
+        if used_chars + len(line) + 1 > budget:
+            break
+        shown_items.append((line, count))
+        used_chars += len(line) + 1
+
+    # Drop a section heading (or spacer) left without any emoji under it.
+    while shown_items and shown_items[-1][1] == 0 and len(shown_items) < len(items):
+        shown_items.pop()
+
+    lines.extend(line for line, _ in shown_items)
+    omitted = total_emoji - sum(count for _, count in shown_items)
+    if omitted:
+        lines.append(f"…ほか {omitted} 個は省略")
+
+    embeds = [{"description": description} for description in _split_descriptions(lines)]
+    embeds[0]["title"] = title
+    embeds[-1]["footer"] = {"text": footer}
+    return embeds
 
 
 def _handle_collect(event, context):
@@ -378,7 +437,7 @@ def _handle_collect(event, context):
         stats, summary = _aggregate(os.environ["GUILD_ID"], days, stop_at)
         payload = {
             "content": "",
-            "embeds": [_build_embed(stats, summary, days)],
+            "embeds": _build_embeds(stats, summary, days, event.get("order", ORDER_TOP)),
             "allowed_mentions": {"parse": []},
         }
         logger.info("Collect completed in %.1fs: %s", time.time() - started, summary)
